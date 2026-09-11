@@ -1,0 +1,8 @@
+.pov/
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+reports/
+dist/
+assets/
