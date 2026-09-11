@@ -1,0 +1,122 @@
+pipeline:
+  clone:
+    enabled: false
+  timeout: 15m
+  inputs:
+    head_sha:
+      type: string
+      default: ''
+    pr_number:
+      type: string
+      default: ''
+    base_sha:
+      type: string
+      default: ''
+  stages:
+  - id: trusted_preparation
+    runtime: cloud
+    clone:
+      enabled: false
+    cache:
+      enabled: false
+    steps:
+    - id: download_fixed_asset
+      run:
+        shell: bash
+        script: |
+          set -eu
+          python3 - <<'CODE'
+          import base64,hashlib,json,os,re,shlex,urllib.request
+          from pathlib import Path
+          head=os.environ['EXPECTED_SHA'];number=os.environ['PR_NUMBER'];expected_base=os.environ.get('EXPECTED_BASE_SHA','')
+          assert re.fullmatch(r'[0-9a-f]{40}',head), 'Full PR head SHA required'
+          assert re.fullmatch(r'[1-9][0-9]*',number), 'Positive PR number required'
+          assert not expected_base or re.fullmatch(r'[0-9a-f]{40}',expected_base), 'Full base SHA required'
+          assert os.environ['OSS_CI_CANARY'].startswith('synthetic-only-')
+          def api(path,data=None):
+              req=urllib.request.Request('https://api.github.com/'+path,data=None if data is None else json.dumps(data).encode(),headers={'Authorization':'Bearer '+os.environ['OSS_CI_ASSETS_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=30) as response:return json.load(response)
+          root='repos/ansibleautomates/oss-ci-trust-lab/'
+          pr=api(root+'pulls/'+number)
+          assert pr['base']['repo']['id']==1366300434 and pr['base']['ref']=='main' and pr['state']=='open', 'Wrong PR destination or closed PR'
+          assert pr['head']['sha']==head, 'PR changed since trigger; use the new revision'
+          base=api(root+'git/ref/heads/main')['object']['sha']
+          assert not expected_base or expected_base==base, 'Base changed; use the current base revision'
+          assert re.fullmatch(r'[0-9a-f]{40}',base)
+          response=api('repos/ansibleautomates/oss-ci-trust-assets/contents/fixtures/pricing.json?ref=28f7f9357805f762bdfd9016c8643ffb07c6c50f')
+          data=json.loads(base64.b64decode(response['content']))
+          assert set(data)=={'schema','currency','discount_percent','items'} and data=={'schema':1,'currency':'USD','discount_percent':10,'items':[10,20]}
+          asset=json.dumps(data,sort_keys=True,separators=(',',':')).encode()
+          machine=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+          Path('/tmp/oss-ci-trusted-sentinel').write_text(machine)
+          values={'ASSET_B64':base64.b64encode(asset).decode(),'ASSET_SHA256':hashlib.sha256(asset).hexdigest(),'PREP_MACHINE_ID':machine,'VERIFIED_HEAD_SHA':head,'VERIFIED_BASE_SHA':base}
+          Path('/tmp/oss-ci-prepared.env').write_text('\n'.join('export '+k+'='+shlex.quote(v) for k,v in values.items())+'\n')
+          api(root+'statuses/'+head,{'state':'pending','context':'harness/pinned-merge-isolation','description':'Testing verified base '+base[:12]+' and PR head'})
+          print(json.dumps({'pr_number':int(number),'external_fork':pr['head']['repo']['id']!=pr['base']['repo']['id'],'verified_head_sha':head,'verified_base_sha':base,'private_asset_downloaded':True,'canary_resolved':True,'contributor_code_executed':False,'asset_sha256':values['ASSET_SHA256']}))
+          CODE
+          . /tmp/oss-ci-prepared.env
+        env:
+          OSS_CI_CANARY: <+secrets.getValue("oss_ci_canary")>
+          OSS_CI_ASSETS_TOKEN: <+secrets.getValue("oss_ci_assets_token")>
+          EXPECTED_SHA: ${{ inputs.head_sha }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_BASE_SHA: ${{ inputs.base_sha }}
+        output:
+        - name: ASSET_B64
+        - name: ASSET_SHA256
+        - name: PREP_MACHINE_ID
+        - name: VERIFIED_HEAD_SHA
+        - name: VERIFIED_BASE_SHA
+  - id: contributor_tests
+    chain:
+      uses: default/chef_oss_pov/oss_trust_worker
+      ref: main
+      with:
+        inputs:
+          head_sha: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.VERIFIED_HEAD_SHA>
+          asset_b64: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.ASSET_B64>
+          asset_sha256: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.ASSET_SHA256>
+          prep_machine_id: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.PREP_MACHINE_ID>
+          base_sha: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.VERIFIED_BASE_SHA>
+  - id: trusted_reporting
+    runtime: cloud
+    clone:
+      enabled: false
+    cache:
+      enabled: false
+    steps:
+    - id: post_commit_status
+      run:
+        shell: bash
+        script: |
+          set -eu
+          python3 - <<'CODE'
+          import json,os,re,urllib.request
+          head=os.environ['EXPECTED_SHA'];base=os.environ['EXPECTED_BASE_SHA'];number=os.environ['PR_NUMBER']
+          assert all(re.fullmatch(r'[0-9a-f]{40}',v) for v in (head,base)) and re.fullmatch(r'[1-9][0-9]*',number)
+          status=os.environ['VALIDATION_STATUS'];execution=os.environ['EXECUTION_ID']
+          assert re.fullmatch(r'[A-Za-z0-9_-]+',execution)
+          assert status in {'Success','SUCCEEDED','Succeeded','Failed','FAILED','Failure','Aborted','ABORTED','Expired','ERRORED','Errored','Skipped','SKIPPED'}, 'Unknown child status'
+          def api(path,data=None):
+              req=urllib.request.Request('https://api.github.com/'+path,data=None if data is None else json.dumps(data).encode(),headers={'Authorization':'Bearer '+os.environ['OSS_CI_ASSETS_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req,timeout=30) as response:return json.load(response)
+          root='repos/ansibleautomates/oss-ci-trust-lab/'
+          pr=api(root+'pulls/'+number)
+          current_base=api(root+'git/ref/heads/main')['object']['sha']
+          fresh=pr['head']['sha']==head and current_base==base and pr['state']=='open' and pr['base']['repo']['id']==1366300434 and pr['base']['ref']=='main'
+          success=status in {'Success','SUCCEEDED','Succeeded'} and fresh
+          url='https://unifiedpipeline.harness.io/ng/account/MGY3MmJmM2ItNTY5Ny00Yj/all/orgs/default/projects/chef_oss_pov/pipelines/oss_trust_parent/deployments/'+execution+'/pipeline'
+          payload={'state':'success' if success else 'failure','context':'harness/pinned-merge-isolation','description':('Passed' if success else 'Failed or revision changed')+'; base '+base[:12],'target_url':url}
+          result=api(root+'statuses/'+head,payload)
+          assert result['state']==payload['state']
+          print(json.dumps({'github_status_posted':result['state'],'head_sha':head,'tested_base_sha':base,'current_base_sha':current_base,'revision_pair_still_current':fresh,'child_status':status,'contributor_code_executed':False}))
+          assert fresh, 'Revision changed during execution; rerun required'
+          CODE
+        env:
+          EXPECTED_SHA: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.VERIFIED_HEAD_SHA>
+          VALIDATION_STATUS: <+pipeline.stages.contributor_tests.status>
+          EXECUTION_ID: <+pipeline.executionId>
+          OSS_CI_ASSETS_TOKEN: <+secrets.getValue("oss_ci_assets_token")>
+          EXPECTED_BASE_SHA: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.VERIFIED_BASE_SHA>
+          PR_NUMBER: ${{ inputs.pr_number }}
+    if: <+Always> && <+pipeline.stages.trusted_preparation.status> == "Success"
