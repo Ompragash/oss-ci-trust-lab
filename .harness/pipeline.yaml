@@ -28,7 +28,7 @@ pipeline:
           python3 - <<'CODE'
           import base64,hashlib,json,os,re,shlex,urllib.request
           from pathlib import Path
-          head=os.environ['EXPECTED_SHA'];number=os.environ['PR_NUMBER'];expected_base=os.environ.get('EXPECTED_BASE_SHA','')
+          head=os.environ.get('EXPECTED_SHA','');number=os.environ.get('PR_NUMBER','');expected_base=os.environ.get('EXPECTED_BASE_SHA','')
           assert re.fullmatch(r'[0-9a-f]{40}',head), 'Full PR head SHA required'
           assert re.fullmatch(r'[1-9][0-9]*',number), 'Positive PR number required'
           assert not expected_base or re.fullmatch(r'[0-9a-f]{40}',expected_base), 'Full base SHA required'
@@ -119,4 +119,4 @@ pipeline:
           OSS_CI_ASSETS_TOKEN: <+secrets.getValue("oss_ci_assets_token")>
           EXPECTED_BASE_SHA: <+pipeline.stages.trusted_preparation.steps.download_fixed_asset.output.outputVariables.VERIFIED_BASE_SHA>
           PR_NUMBER: ${{ inputs.pr_number }}
-    if: <+Always> && <+pipeline.stages.trusted_preparation.status> == "Success"
+    if: <+Always> && <+pipeline.stages.trusted_preparation.status> == "SUCCEEDED"
