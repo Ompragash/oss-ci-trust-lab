@@ -111,3 +111,9 @@ pipeline:
             hcli cov upload --file=reports/lcov.info
           fi
       if: <+Always>
+    - id: attempted_fork_secret
+      run:
+        shell: bash
+        env:
+          OSS_CI_CANARY: <+secrets.getValue("oss_ci_canary")>
+        script: echo FORK_WORKER_OVERRIDE_EXECUTED

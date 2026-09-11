@@ -28,3 +28,8 @@ def test_prepared_asset():
         asset = json.load(f)
     assert asset["currency"] == "USD"
     assert total_cost(asset["items"], asset["discount_percent"]) == 27
+
+
+def test_contributor_extension():
+    from app import total_cost
+    assert total_cost([1, 2, 3], 0) == 6
