@@ -1,0 +1,113 @@
+pipeline:
+  clone:
+    enabled: false
+  timeout: 10m
+  inputs:
+    head_sha:
+      type: string
+      default: ''
+    asset_b64:
+      type: string
+      default: ''
+    asset_sha256:
+      type: string
+      default: ''
+    prep_machine_id:
+      type: string
+      default: ''
+    base_sha:
+      type: string
+      default: ''
+  env:
+    CI_ENABLE_HCLI_FOR_TESTS: 'true'
+  stages:
+  - id: isolated_tests
+    runtime: cloud
+    clone:
+      enabled: false
+    cache:
+      enabled: false
+    steps:
+    - id: verify_asset_and_isolation
+      run:
+        shell: bash
+        script: |
+          set -eu
+          python3 - <<'PY'
+          import base64,hashlib,json,os
+          from pathlib import Path
+          asset=base64.b64decode(os.environ['ASSET_B64'],validate=True)
+          assert hashlib.sha256(asset).hexdigest()==os.environ['ASSET_SHA256'], 'Prepared asset checksum mismatch'
+          data=json.loads(asset)
+          assert set(data)=={'schema','currency','discount_percent','items'}
+          assert data['schema']==1 and data['currency']=='USD'
+          machine=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+          assert machine!=os.environ['PREP_MACHINE_ID'], 'Trusted and contributor jobs share a machine'
+          assert not Path('/tmp/oss-ci-trusted-sentinel').exists(), 'Trusted workspace visible'
+          Path('/tmp/approved-assets').mkdir(exist_ok=True)
+          Path('/tmp/approved-assets/pricing.json').write_bytes(asset)
+          print(json.dumps({'approved_asset_verified':True,'separate_machine':True,'trusted_workspace_absent':True,'asset_sha256':hashlib.sha256(asset).hexdigest()}))
+          PY
+        env:
+          ASSET_B64: ${{ inputs.asset_b64 }}
+          ASSET_SHA256: ${{ inputs.asset_sha256 }}
+          PREP_MACHINE_ID: ${{ inputs.prep_machine_id }}
+    - id: merge_pinned_revisions
+      run:
+        shell: bash
+        script: |
+          set -eu
+          python3 - <<'CODE'
+          import json,os,re,subprocess
+          head=os.environ['EXPECTED_SHA']
+          base=os.environ['EXPECTED_BASE_SHA']
+          assert all(re.fullmatch(r'[0-9a-f]{40}',s) for s in (base,head)), 'Full base and head SHAs required'
+          def run(*args): subprocess.run(['git',*args],check=True)
+          run('init')
+          run('remote','add','origin','https://github.com/ansibleautomates/oss-ci-trust-lab.git')
+          for sha in (base,head): run('-c','credential.helper=','fetch','--depth=100','origin',sha)
+          run('checkout','--detach',base)
+          run('-c','user.name=OSS CI Validation','-c','user.email=ci@example.invalid','merge','--no-edit',head)
+          run('merge-base','--is-ancestor',base,'HEAD')
+          run('merge-base','--is-ancestor',head,'HEAD')
+          actual=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          print(json.dumps({'base_sha':base,'head_sha':head,'tested_merge_sha':actual,'both_revisions_included':True,'checkout_authentication':'anonymous'}))
+          CODE
+        env:
+          EXPECTED_SHA: ${{ inputs.head_sha }}
+          EXPECTED_BASE_SHA: ${{ inputs.base_sha }}
+    - id: probe_contributor_access
+      run:
+        shell: bash
+        script: python3 scripts/probe_boundaries.py
+    - id: build_and_run
+      run:
+        shell: bash
+        script: |
+          set -eu
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --disable-pip-version-check -r requirements-test.txt
+          .venv/bin/python -m compileall -q app.py
+          mkdir -p dist
+          cp app.py dist/app.py
+          .venv/bin/python app.py
+    - id: test
+      run:
+        shell: bash
+        script: |
+          set -eu
+          .venv/bin/python -m pytest -q --junitxml=reports/junit.xml --cov=app --cov-report=lcov:reports/lcov.info --cov-report=xml:reports/coverage.xml --cov-report=html:reports/coverage-html --cov-report=term-missing
+        env:
+          APPROVED_ASSET_PATH: /tmp/approved-assets/pricing.json
+    - id: upload_reports
+      run:
+        shell: bash
+        script: |
+          set -eu
+          if [ -f reports/junit.xml ]; then
+            hcli test-reports upload reports/junit.xml
+          fi
+          if [ -f reports/lcov.info ]; then
+            hcli cov upload --file=reports/lcov.info
+          fi
+      if: <+Always>
